@@ -10,7 +10,8 @@ function initDb(dbPath = './database.sqlite') {
       threshold_type TEXT DEFAULT 'fixed',
       threshold_value INTEGER DEFAULT 5,
       poll_duration_seconds INTEGER DEFAULT 300,
-      user_cooldown_seconds INTEGER DEFAULT 600
+      user_cooldown_seconds INTEGER DEFAULT 600,
+      allow_pardon TEXT DEFAULT 'true'
     );
 
     CREATE TABLE IF NOT EXISTS user_cooldowns (
@@ -20,11 +21,12 @@ function initDb(dbPath = './database.sqlite') {
       PRIMARY KEY (guild_id, user_id)
     );
 
-    CREATE TABLE IF NOT EXISTS active_mutes (
+    CREATE TABLE IF NOT EXISTS active_punishments (
       guild_id TEXT,
       user_id TEXT,
+      punishment_type TEXT DEFAULT 'mute',
       unmute_at INTEGER,
-      PRIMARY KEY (guild_id, user_id)
+      PRIMARY KEY (guild_id, user_id, punishment_type)
     );
   `);
 }
@@ -36,20 +38,21 @@ function getGuildSettings(guildId) {
       threshold_type: 'fixed',
       threshold_value: 5,
       poll_duration_seconds: 300,
-      user_cooldown_seconds: 600
+      user_cooldown_seconds: 600,
+      allow_pardon: 'true'
     };
   }
   return row;
 }
 
 function updateGuildSetting(guildId, key, value) {
-  const allowedKeys = ['threshold_type', 'threshold_value', 'poll_duration_seconds', 'user_cooldown_seconds'];
+  const allowedKeys = ['threshold_type', 'threshold_value', 'poll_duration_seconds', 'user_cooldown_seconds', 'allow_pardon'];
   if (!allowedKeys.includes(key)) throw new Error('Invalid setting key');
 
   db.prepare(`
     INSERT INTO guild_settings (guild_id, ${key}) VALUES (?, ?)
     ON CONFLICT(guild_id) DO UPDATE SET ${key} = excluded.${key}
-  `).run(guildId, value);
+  `).run(guildId, String(value));
 }
 
 function checkUserCooldown(guildId, userId, cooldownSeconds) {
@@ -67,32 +70,77 @@ function updateUserCooldown(guildId, userId) {
   `).run(guildId, userId, now);
 }
 
-function saveActiveMute(guildId, userId, unmuteAtTimestamp) {
+function saveActivePunishment(guildId, userId, punishmentType = 'mute', unmuteAtTimestamp) {
   db.prepare(`
-    INSERT INTO active_mutes (guild_id, user_id, unmute_at) VALUES (?, ?, ?)
-    ON CONFLICT(guild_id, user_id) DO UPDATE SET unmute_at = excluded.unmute_at
-  `).run(guildId, userId, unmuteAtTimestamp);
+    INSERT INTO active_punishments (guild_id, user_id, punishment_type, unmute_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(guild_id, user_id, punishment_type) DO UPDATE SET unmute_at = excluded.unmute_at
+  `).run(guildId, userId, punishmentType, unmuteAtTimestamp);
+}
+
+function removeActivePunishment(guildId, userId, punishmentType = null) {
+  if (punishmentType) {
+    db.prepare('DELETE FROM active_punishments WHERE guild_id = ? AND user_id = ? AND punishment_type = ?').run(guildId, userId, punishmentType);
+  } else {
+    db.prepare('DELETE FROM active_punishments WHERE guild_id = ? AND user_id = ?').run(guildId, userId);
+  }
+}
+
+function getPendingPunishments() {
+  return db.prepare('SELECT * FROM active_punishments').all();
+}
+
+function getActivePunishmentForUser(guildId, userId, punishmentType) {
+  return db.prepare('SELECT * FROM active_punishments WHERE guild_id = ? AND user_id = ? AND punishment_type = ?').get(guildId, userId, punishmentType);
+}
+
+function getAllActivePunishmentsForUser(guildId, userId) {
+  return db.prepare('SELECT * FROM active_punishments WHERE guild_id = ? AND user_id = ?').all(guildId, userId);
+}
+
+function getExpiredPunishments(guildId, userId) {
+  const now = Math.floor(Date.now() / 1000);
+  if (guildId && userId) {
+    return db.prepare('SELECT * FROM active_punishments WHERE guild_id = ? AND user_id = ? AND unmute_at <= ?').all(guildId, userId, now);
+  }
+  return db.prepare('SELECT * FROM active_punishments WHERE unmute_at <= ?').all(now);
+}
+
+// Backward compatibility helpers
+function saveActiveMute(guildId, userId, unmuteAtTimestamp) {
+  saveActivePunishment(guildId, userId, 'mute', unmuteAtTimestamp);
 }
 
 function removeActiveMute(guildId, userId) {
-  db.prepare('DELETE FROM active_mutes WHERE guild_id = ? AND user_id = ?').run(guildId, userId);
+  removeActivePunishment(guildId, userId, 'mute');
 }
 
 function getPendingMutes() {
-  return db.prepare('SELECT * FROM active_mutes').all();
+  return getPendingPunishments();
 }
 
 function getActiveMuteForUser(guildId, userId) {
-  return db.prepare('SELECT * FROM active_mutes WHERE guild_id = ? AND user_id = ?').get(guildId, userId);
+  return getActivePunishmentForUser(guildId, userId, 'mute');
 }
 
 function getExpiredMutes(guildId, userId) {
-  const now = Math.floor(Date.now() / 1000);
-  if (guildId && userId) {
-    return db.prepare('SELECT * FROM active_mutes WHERE guild_id = ? AND user_id = ? AND unmute_at <= ?').all(guildId, userId, now);
-  }
-  return db.prepare('SELECT * FROM active_mutes WHERE unmute_at <= ?').all(now);
+  return getExpiredPunishments(guildId, userId);
 }
 
-module.exports = { initDb, getGuildSettings, updateGuildSetting, checkUserCooldown, updateUserCooldown, saveActiveMute, removeActiveMute, getPendingMutes, getActiveMuteForUser, getExpiredMutes };
-
+module.exports = {
+  initDb,
+  getGuildSettings,
+  updateGuildSetting,
+  checkUserCooldown,
+  updateUserCooldown,
+  saveActivePunishment,
+  removeActivePunishment,
+  getPendingPunishments,
+  getActivePunishmentForUser,
+  getAllActivePunishmentsForUser,
+  getExpiredPunishments,
+  saveActiveMute,
+  removeActiveMute,
+  getPendingMutes,
+  getActiveMuteForUser,
+  getExpiredMutes
+};

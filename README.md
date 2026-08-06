@@ -1,14 +1,14 @@
 # Discord Democracy Moderation Bot
 
-A Discord bot that gives your community democratic control over temporary timeouts and voice mutes. Server members can start votes to punish disruptive members, and if the community agrees, everyone votes on how long the punishment lasts.
+A Discord bot that gives your community democratic control over temporary timeouts, voice mutes, and voice deafens. Server members can start votes to punish disruptive members, and if the community agrees, everyone votes on how long the punishment lasts. Members can also start democratic votes to pardon punished members early!
 
 ---
 
 ## How It Works
 
-1. **Stage 1 — Vote to Punish**: Someone starts a vote against a member using `/vote-punish`. Other members click **Yes** or **No**.
-2. **Stage 2 — Vote on Duration**: If Stage 1 passes, a dropdown menu appears allowing members to vote on the duration (1m, 3m, 5m, 10m, 15m, or 1 year). The duration with the most votes wins.
-3. **Automatic Unmuting & Persistence**: Voice mutes are tracked in a local SQLite database (`database.sqlite`). If a muted user leaves voice or the bot restarts, their mute status persists and automatically clears when their time expires or when they re-join voice.
+1. **Stage 1 — Vote to Punish or Pardon**: Someone starts a vote against a member using `/vote-punish` or `/vote-pardon`. Other members click **Yes** or **No**.
+2. **Stage 2 — Vote on Duration**: For punishments, if Stage 1 passes, a dropdown menu appears allowing members to vote on the duration (1m, 3m, 5m, 10m, 15m, or 1 year). The duration with the most votes wins.
+3. **Automatic Unmuting/Undeafening & Persistence**: Voice mutes and voice deafens are tracked in a local SQLite database (`database.sqlite`). If a punished user leaves voice or the bot restarts, their punishment status persists and automatically clears when their time expires or when they re-join voice.
 
 ---
 
@@ -16,11 +16,12 @@ A Discord bot that gives your community democratic control over temporary timeou
 
 | Command | Description | Permissions |
 | --- | --- | --- |
-| `/vote-punish target action [reason]` | Start a vote to `timeout` or `mute` a member. If targeting someone in a voice channel, you must be in the same voice channel. | Anyone (subject to cooldown) |
+| `/vote-punish target action [reason]` | Start a vote to `timeout`, `mute`, or `deafen` a member. If targeting someone in a voice channel, you must be in the same voice channel. | Anyone (subject to cooldown) |
+| `/vote-pardon target [reason]` | Start a vote to pardon a member and lift their active mute, deafen, or timeout early. | Anyone (subject to cooldown) |
 | `/stop-vote` | Cancel the vote running in the current channel. | Poll Initiator, Server Owner, or Admin |
 | `/skip-stage target` | Skip the current stage of an active vote for a member (advances Stage 1 to Stage 2, or Stage 2 straight to punishment). | Server Owner or Admin |
-| `/check-status [target]` | View active polls, voice mute/timeout status, remaining duration, and cooldown status for a member (or yourself if left blank). | Anyone |
-| `/config setting value` | Configure server thresholds (`threshold_type`, `threshold_value`, `poll_duration_seconds`, `user_cooldown_seconds`). | Admin Only |
+| `/check-status [target]` | View active polls, voice mute/deafen/timeout status, remaining duration, and cooldown status for a member (or yourself if left blank). | Anyone |
+| `/config setting value` | Configure server thresholds (`threshold_type`, `threshold_value`, `poll_duration_seconds`, `user_cooldown_seconds`, `allow_pardon`). | Admin Only |
 
 ---
 
@@ -35,6 +36,7 @@ Admins can customize how votes pass using `/config`:
 - **`threshold_value`**: The number or percentage required (e.g., `5` or `60`).
 - **`poll_duration_seconds`**: Time in seconds each voting stage remains open (default: `300` seconds / 5 mins).
 - **`user_cooldown_seconds`**: Cooldown time before a non-admin user can start another vote (default: `600` seconds / 10 mins).
+- **`allow_pardon`**: Toggle whether pardon voting is enabled (`true` / `false`, default: `true`).
 
 ---
 
@@ -44,6 +46,7 @@ Admins can customize how votes pass using `/config`:
 - **Bot Privileges**: The bot needs the following Discord permissions:
   - `Moderate Members` (for timeouts)
   - `Mute Members` (for voice mutes)
+  - `Deafen Members` (for voice deafens)
   - `Use Application Commands`
   - Gateway Intents: `Guilds`, `GuildMembers`, `GuildVoiceStates`
 

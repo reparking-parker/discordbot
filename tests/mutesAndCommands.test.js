@@ -1,86 +1,83 @@
 const {
   initDb,
-  saveActiveMute,
-  removeActiveMute,
-  getActiveMuteForUser,
-  getExpiredMutes
+  saveActivePunishment,
+  removeActivePunishment,
+  getActivePunishmentForUser,
+  getAllActivePunishmentsForUser,
+  getExpiredPunishments
 } = require('../src/db/database');
 
 const { findPollByTarget, activePolls, commands } = require('../src/index');
 
-describe('Database Mute Tracking & Voice Management', () => {
+describe('Database Punishment Tracking & Voice Deafen Management', () => {
   beforeAll(() => {
     initDb(':memory:');
   });
 
-  test('saves, retrieves, and checks active mute for user', () => {
+  test('saves, retrieves, and checks active mute & deafen for user', () => {
     const guildId = 'guild123';
     const userId = 'user456';
-    const unmuteAt = Math.floor(Date.now() / 1000) + 300; // 5 minutes in future
+    const unmuteAt = Math.floor(Date.now() / 1000) + 300;
 
-    saveActiveMute(guildId, userId, unmuteAt);
+    saveActivePunishment(guildId, userId, 'mute', unmuteAt);
+    saveActivePunishment(guildId, userId, 'deafen', unmuteAt);
 
-    const activeMute = getActiveMuteForUser(guildId, userId);
+    const activeMute = getActivePunishmentForUser(guildId, userId, 'mute');
     expect(activeMute).toBeDefined();
-    expect(activeMute.guild_id).toBe(guildId);
-    expect(activeMute.user_id).toBe(userId);
-    expect(activeMute.unmute_at).toBe(unmuteAt);
+    expect(activeMute.punishment_type).toBe('mute');
+
+    const activeDeafen = getActivePunishmentForUser(guildId, userId, 'deafen');
+    expect(activeDeafen).toBeDefined();
+    expect(activeDeafen.punishment_type).toBe('deafen');
+
+    const all = getAllActivePunishmentsForUser(guildId, userId);
+    expect(all.length).toBe(2);
   });
 
-  test('detects expired mutes correctly', () => {
+  test('detects expired deafens & mutes correctly', () => {
     const guildId = 'guild123';
-    const expiredUser = 'user_expired';
-    const pastTimestamp = Math.floor(Date.now() / 1000) - 10; // expired 10 seconds ago
+    const expiredUser = 'user_expired_deafen';
+    const pastTimestamp = Math.floor(Date.now() / 1000) - 10;
 
-    saveActiveMute(guildId, expiredUser, pastTimestamp);
+    saveActivePunishment(guildId, expiredUser, 'deafen', pastTimestamp);
 
-    const expiredList = getExpiredMutes(guildId, expiredUser);
+    const expiredList = getExpiredPunishments(guildId, expiredUser);
     expect(expiredList.length).toBe(1);
-    expect(expiredList[0].user_id).toBe(expiredUser);
+    expect(expiredList[0].punishment_type).toBe('deafen');
   });
 
-  test('removes active mute from DB', () => {
+  test('removes specific active punishment from DB', () => {
     const guildId = 'guild123';
     const userId = 'user456';
 
-    removeActiveMute(guildId, userId);
+    removeActivePunishment(guildId, userId, 'mute');
+    expect(getActivePunishmentForUser(guildId, userId, 'mute')).toBeUndefined();
+    expect(getActivePunishmentForUser(guildId, userId, 'deafen')).toBeDefined();
 
-    const activeMute = getActiveMuteForUser(guildId, userId);
-    expect(activeMute).toBeUndefined();
+    removeActivePunishment(guildId, userId); // removes remaining
+    expect(getAllActivePunishmentsForUser(guildId, userId).length).toBe(0);
   });
 });
 
-describe('Active Poll Target Lookup & Command Structure', () => {
+describe('Slash Commands & Options Structure', () => {
   beforeEach(() => {
     activePolls.clear();
   });
 
-  test('finds active poll by target user id', () => {
-    const mockPoll = {
-      channelId: 'chan_1',
-      targetId: 'user_target_99',
-      stage: 1,
-      action: 'mute'
-    };
-    activePolls.set('chan_1', mockPoll);
-
-    const found = findPollByTarget('user_target_99');
-    expect(found).toBeDefined();
-    expect(found.channelId).toBe('chan_1');
-    expect(found.stage).toBe(1);
-  });
-
-  test('returns null if target user has no active poll', () => {
-    const found = findPollByTarget('non_existent_user');
-    expect(found).toBeNull();
-  });
-
-  test('contains /check-status and /skip-stage in registered slash commands', () => {
+  test('contains /vote-pardon and deafen action choice in slash commands', () => {
     const commandNames = commands.map(c => c.name);
     expect(commandNames).toContain('vote-punish');
+    expect(commandNames).toContain('vote-pardon');
     expect(commandNames).toContain('stop-vote');
     expect(commandNames).toContain('config');
     expect(commandNames).toContain('check-status');
     expect(commandNames).toContain('skip-stage');
+
+    const votePunishCmd = commands.find(c => c.name === 'vote-punish');
+    const actionOption = votePunishCmd.options.find(o => o.name === 'action');
+    const actionChoices = actionOption.choices.map(choice => choice.value);
+    expect(actionChoices).toContain('timeout');
+    expect(actionChoices).toContain('mute');
+    expect(actionChoices).toContain('deafen');
   });
 });

@@ -1,6 +1,23 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ComponentType } = require('discord.js');
-const { initDb, getGuildSettings, updateGuildSetting, checkUserCooldown, updateUserCooldown, saveActiveMute, removeActiveMute, getPendingMutes, getActiveMuteForUser, getExpiredMutes } = require('./db/database');
+const {
+  initDb,
+  getGuildSettings,
+  updateGuildSetting,
+  checkUserCooldown,
+  updateUserCooldown,
+  saveActivePunishment,
+  removeActivePunishment,
+  getPendingPunishments,
+  getActivePunishmentForUser,
+  getAllActivePunishmentsForUser,
+  getExpiredPunishments,
+  saveActiveMute,
+  removeActiveMute,
+  getPendingMutes,
+  getActiveMuteForUser,
+  getExpiredMutes
+} = require('./db/database');
 const { evaluateStage1Result, checkImmunity } = require('./logic/democracyEngine');
 
 initDb();
@@ -26,9 +43,15 @@ const commands = [
     .addStringOption(opt => opt.setName('action').setDescription('punishment type').setRequired(true)
       .addChoices(
         { name: 'timeout', value: 'timeout' },
-        { name: 'mute', value: 'mute' }
+        { name: 'mute', value: 'mute' },
+        { name: 'deafen', value: 'deafen' }
       ))
     .addStringOption(opt => opt.setName('reason').setDescription('reason for the punishment').setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('vote-pardon')
+    .setDescription('start a vote to pardon a member (lift mute, deafen, or timeout early)')
+    .addUserOption(opt => opt.setName('target').setDescription('member to pardon').setRequired(true))
+    .addStringOption(opt => opt.setName('reason').setDescription('reason for the pardon').setRequired(false)),
   new SlashCommandBuilder()
     .setName('stop-vote')
     .setDescription('stop the active vote in this channel'),
@@ -40,7 +63,8 @@ const commands = [
         { name: 'threshold_type (fixed / percentage / majority)', value: 'threshold_type' },
         { name: 'threshold_value', value: 'threshold_value' },
         { name: 'poll_duration_seconds', value: 'poll_duration_seconds' },
-        { name: 'user_cooldown_seconds', value: 'user_cooldown_seconds' }
+        { name: 'user_cooldown_seconds', value: 'user_cooldown_seconds' },
+        { name: 'allow_pardon (true / false)', value: 'allow_pardon' }
       ))
     .addStringOption(opt => opt.setName('value').setDescription('setting value').setRequired(true)),
   new SlashCommandBuilder()
@@ -49,7 +73,7 @@ const commands = [
     .addUserOption(opt => opt.setName('target').setDescription('member to check (defaults to self)').setRequired(false)),
   new SlashCommandBuilder()
     .setName('skip-stage')
-    .setDescription('skip the current stage of an active vote for a member')
+    .setDescription('skip the current stage of an active vote for a member (Admin/Owner only)')
     .addUserOption(opt => opt.setName('target').setDescription('member whose vote stage to skip').setRequired(true))
 ];
 
@@ -65,8 +89,8 @@ client.once('ready', async () => {
     }
   }
 
-  // Restore pending voice unmutes on startup
-  restorePendingVoiceMutes();
+  // Restore pending voice unmutes and undeafens on startup
+  restorePendingPunishments();
 });
 
 function scheduleUnmute(guildId, userId, delayMs) {
@@ -78,16 +102,15 @@ function scheduleUnmute(guildId, userId, delayMs) {
         if (member) {
           if (member.voice && member.voice.channel) {
             await member.voice.setMute(false, 'democratic vote mute duration expired');
-            removeActiveMute(guildId, userId);
+            removeActivePunishment(guildId, userId, 'mute');
           } else {
-            // Member is currently not in a voice channel.
-            // Leave active_mutes entry in DB so voiceStateUpdate will unmute upon joining VC.
+            // Member is not in VC. Keep in DB for voiceStateUpdate.
           }
         } else {
-          removeActiveMute(guildId, userId);
+          removeActivePunishment(guildId, userId, 'mute');
         }
       } else {
-        removeActiveMute(guildId, userId);
+        removeActivePunishment(guildId, userId, 'mute');
       }
     } catch (err) {
       console.error(`failed to unmute user ${userId}:`, err);
@@ -95,15 +118,41 @@ function scheduleUnmute(guildId, userId, delayMs) {
   }, Math.max(0, delayMs));
 }
 
-function restorePendingVoiceMutes() {
-  const pending = getPendingMutes();
+function scheduleUndeafen(guildId, userId, delayMs) {
+  setTimeout(async () => {
+    try {
+      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      if (guild) {
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (member) {
+          if (member.voice && member.voice.channel) {
+            await member.voice.setDeaf(false, 'democratic vote deafen duration expired');
+            removeActivePunishment(guildId, userId, 'deafen');
+          } else {
+            // Member is not in VC. Keep in DB for voiceStateUpdate.
+          }
+        } else {
+          removeActivePunishment(guildId, userId, 'deafen');
+        }
+      } else {
+        removeActivePunishment(guildId, userId, 'deafen');
+      }
+    } catch (err) {
+      console.error(`failed to undeafen user ${userId}:`, err);
+    }
+  }, Math.max(0, delayMs));
+}
+
+function restorePendingPunishments() {
+  const pending = getPendingPunishments();
   const now = Math.floor(Date.now() / 1000);
-  for (const mute of pending) {
-    const remainingSec = mute.unmute_at - now;
-    if (remainingSec <= 0) {
-      scheduleUnmute(mute.guild_id, mute.user_id, 0);
-    } else {
-      scheduleUnmute(mute.guild_id, mute.user_id, remainingSec * 1000);
+  for (const p of pending) {
+    const remainingSec = p.unmute_at - now;
+    const delay = Math.max(0, remainingSec * 1000);
+    if (p.punishment_type === 'mute') {
+      scheduleUnmute(p.guild_id, p.user_id, delay);
+    } else if (p.punishment_type === 'deafen') {
+      scheduleUndeafen(p.guild_id, p.user_id, delay);
     }
   }
 }
@@ -112,26 +161,41 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   if (!newState.channelId) return;
   const guildId = newState.guild.id;
   const userId = newState.id;
-  const activeMute = getActiveMuteForUser(guildId, userId);
-  if (!activeMute) return;
+  const activePunishments = getAllActivePunishmentsForUser(guildId, userId);
+  if (!activePunishments || activePunishments.length === 0) return;
 
   const now = Math.floor(Date.now() / 1000);
-  if (activeMute.unmute_at <= now) {
-    try {
-      if (newState.member) {
-        await newState.member.voice.setMute(false, 'democratic vote mute duration expired');
-      }
-    } catch (err) {
-      console.error(`failed to unmute user ${userId} on VC join:`, err);
-    } finally {
-      removeActiveMute(guildId, userId);
-    }
-  } else {
-    if (newState.member && !newState.serverMute) {
+  for (const p of activePunishments) {
+    if (p.unmute_at <= now) {
       try {
-        await newState.member.voice.setMute(true, 'active democratic vote mute');
+        if (newState.member) {
+          if (p.punishment_type === 'mute') {
+            await newState.member.voice.setMute(false, 'democratic vote mute duration expired');
+          } else if (p.punishment_type === 'deafen') {
+            await newState.member.voice.setDeaf(false, 'democratic vote deafen duration expired');
+          }
+        }
       } catch (err) {
-        console.error(`failed to re-enforce mute for user ${userId} on VC join:`, err);
+        console.error(`failed to remove expired ${p.punishment_type} for user ${userId} on VC join:`, err);
+      } finally {
+        removeActivePunishment(guildId, userId, p.punishment_type);
+      }
+    } else {
+      if (newState.member) {
+        if (p.punishment_type === 'mute' && !newState.serverMute) {
+          try {
+            await newState.member.voice.setMute(true, 'active democratic vote mute');
+          } catch (err) {
+            console.error(`failed to re-enforce mute for user ${userId} on VC join:`, err);
+          }
+        }
+        if (p.punishment_type === 'deafen' && !newState.serverDeaf) {
+          try {
+            await newState.member.voice.setDeaf(true, 'active democratic vote deafen');
+          } catch (err) {
+            console.error(`failed to re-enforce deafen for user ${userId} on VC join:`, err);
+          }
+        }
       }
     }
   }
@@ -155,6 +219,8 @@ client.on('interactionCreate', async (interaction) => {
       if (isNaN(val) || val <= 0) return interaction.reply({ content: 'value must be a positive number', ephemeral: true });
     } else if (settingKey === 'threshold_type' && !['fixed', 'percentage', 'majority'].includes(val)) {
       return interaction.reply({ content: 'value must be fixed, percentage, or majority', ephemeral: true });
+    } else if (settingKey === 'allow_pardon' && !['true', 'false'].includes(val.toLowerCase())) {
+      return interaction.reply({ content: 'value must be true or false', ephemeral: true });
     }
 
     updateGuildSetting(guildId, settingKey, val);
@@ -181,9 +247,9 @@ client.on('interactionCreate', async (interaction) => {
       statusLines.push(`• **active poll**: none`);
     }
 
-    // 2. Active punishment
+    // 2. Active punishments
     const now = Math.floor(Date.now() / 1000);
-    const activeMute = getActiveMuteForUser(guildId, targetUser.id);
+    const activeMute = getActivePunishmentForUser(guildId, targetUser.id, 'mute');
     if (activeMute) {
       const remaining = activeMute.unmute_at - now;
       if (remaining > 0) {
@@ -193,6 +259,18 @@ client.on('interactionCreate', async (interaction) => {
       }
     } else {
       statusLines.push(`• **voice mute**: none`);
+    }
+
+    const activeDeafen = getActivePunishmentForUser(guildId, targetUser.id, 'deafen');
+    if (activeDeafen) {
+      const remaining = activeDeafen.unmute_at - now;
+      if (remaining > 0) {
+        statusLines.push(`• **voice deafen**: active (undeafens <t:${activeDeafen.unmute_at}:R>)`);
+      } else {
+        statusLines.push(`• **voice deafen**: expired (will clear upon joining voice)`);
+      }
+    } else {
+      statusLines.push(`• **voice deafen**: none`);
     }
 
     if (targetMember && targetMember.communicationDisabledUntilTimestamp && targetMember.communicationDisabledUntilTimestamp > Date.now()) {
@@ -253,6 +331,156 @@ client.on('interactionCreate', async (interaction) => {
     activePolls.delete(channelId);
 
     return interaction.reply({ content: `vote was stopped by ${user}` });
+  }
+
+  if (commandName === 'vote-pardon') {
+    if (settings.allow_pardon === 'false') {
+      return interaction.reply({ content: 'pardon voting is currently disabled on this server', ephemeral: true });
+    }
+
+    if (activePolls.has(channelId)) {
+      return interaction.reply({ content: 'there is already a vote running in this channel', ephemeral: true });
+    }
+
+    const targetUser = interaction.options.getUser('target');
+    const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+    if (!targetMember) return interaction.reply({ content: 'member not found', ephemeral: true });
+
+    const activePunishments = getAllActivePunishmentsForUser(guildId, targetUser.id);
+    const isTimedOut = targetMember.communicationDisabledUntilTimestamp && targetMember.communicationDisabledUntilTimestamp > Date.now();
+
+    if ((!activePunishments || activePunishments.length === 0) && !isTimedOut) {
+      return interaction.reply({ content: `${targetUser} has no active punishments to pardon`, ephemeral: true });
+    }
+
+    const isOwnerOrAdmin = interaction.guild.ownerId === user.id || member.permissions.has('Administrator');
+    if (!isOwnerOrAdmin && !checkUserCooldown(guildId, user.id, settings.user_cooldown_seconds)) {
+      return interaction.reply({ content: 'you are on cooldown. try again later', ephemeral: true });
+    }
+
+    updateUserCooldown(guildId, user.id);
+
+    const reason = interaction.options.getString('reason');
+    const reasonText = reason ? ` for "${reason}"` : '';
+
+    let totalVotersCount = 0;
+    let vcNotice = '';
+    const callerVc = member.voice ? member.voice.channel : null;
+    const targetVc = targetMember.voice ? targetMember.voice.channel : null;
+
+    if (targetVc) {
+      if (!callerVc || callerVc.id !== targetVc.id) {
+        return interaction.reply({ content: `you must be in the same voice channel as ${targetUser} to start a pardon vote`, ephemeral: true });
+      }
+      const humanMembersInVc = callerVc.members.filter(m => !m.user.bot && m.id !== targetMember.id);
+      totalVotersCount = humanMembersInVc.size;
+      vcNotice = `\nvc mode: ${totalVotersCount} active voters in voice channel.`;
+    }
+
+    const votes = { yes: new Set(), no: new Set() };
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('vote_yes').setLabel('yes (pardon)').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('vote_no').setLabel('no').setStyle(ButtonStyle.Secondary)
+    );
+
+    const endTimestamp = Math.floor((Date.now() + settings.poll_duration_seconds * 1000) / 1000);
+
+    let needText = '';
+    if (settings.threshold_type === 'majority') {
+      needText = 'need majority (more yes than no)';
+    } else if (settings.threshold_type === 'percentage') {
+      needText = `need ${settings.threshold_value}% yes`;
+    } else {
+      needText = `need ${settings.threshold_value} votes`;
+    }
+
+    const pollMessage = await interaction.reply({
+      content: `vote to pardon ${targetUser}${reasonText}. started by ${user}.${vcNotice}\nends <t:${endTimestamp}:R>\n${needText}.\n\nyes: 0 | no: 0`,
+      components: [row],
+      fetchReply: true
+    });
+
+    const collector = pollMessage.createMessageComponentCollector({
+      componentType: ComponentType.Button,
+      time: settings.poll_duration_seconds * 1000
+    });
+
+    const pollState = {
+      channelId,
+      targetId: targetUser.id,
+      targetMember,
+      initiatorId: user.id,
+      stage: 1,
+      action: 'pardon',
+      reason,
+      collector,
+      pollMessage,
+      votes,
+      stoppedReason: null
+    };
+    activePolls.set(channelId, pollState);
+
+    collector.on('collect', async (i) => {
+      votes.yes.delete(i.user.id);
+      votes.no.delete(i.user.id);
+      if (i.customId === 'vote_yes') votes.yes.add(i.user.id);
+      if (i.customId === 'vote_no') votes.no.add(i.user.id);
+
+      await i.update({
+        content: `vote to pardon ${targetUser}${reasonText}. started by ${user}.${vcNotice}\nends <t:${endTimestamp}:R>\n${needText}.\n\nyes: ${votes.yes.size} | no: ${votes.no.size}`,
+        components: [row]
+      });
+
+      if (settings.threshold_type !== 'majority') {
+        const currentVotesObj = { yes: Array.from(votes.yes), no: Array.from(votes.no) };
+        if (evaluateStage1Result(currentVotesObj, settings, totalVotersCount)) {
+          collector.stop('threshold_met');
+        }
+      }
+    });
+
+    collector.on('end', async (collected, colReason) => {
+      activePolls.delete(channelId);
+
+      if (colReason === 'user_stopped') {
+        return pollMessage.edit({
+          content: `vote was stopped.`,
+          components: []
+        });
+      }
+
+      const votesObj = { yes: Array.from(votes.yes), no: Array.from(votes.no) };
+      const passed = evaluateStage1Result(votesObj, settings, totalVotersCount);
+
+      if (!passed) {
+        return pollMessage.edit({
+          content: `pardon vote failed. not enough votes to pardon ${targetUser}. (yes: ${votes.yes.size} | no: ${votes.no.size})`,
+          components: []
+        });
+      }
+
+      try {
+        if (targetMember.voice && targetMember.voice.channel) {
+          await targetMember.voice.setMute(false, 'pardon vote passed').catch(() => {});
+          await targetMember.voice.setDeaf(false, 'pardon vote passed').catch(() => {});
+        }
+        removeActivePunishment(guildId, targetUser.id);
+        if (targetMember.communicationDisabledUntilTimestamp && targetMember.communicationDisabledUntilTimestamp > Date.now()) {
+          await targetMember.timeout(null, 'pardon vote passed').catch(() => {});
+        }
+
+        await pollMessage.edit({
+          content: `pardon vote passed! ${targetUser} has been pardoned and all active punishments have been removed.`,
+          components: []
+        });
+      } catch (err) {
+        await pollMessage.edit({
+          content: `failed to pardon ${targetUser}. check bot permissions.`,
+          components: []
+        });
+      }
+    });
   }
 
   if (commandName === 'vote-punish') {
@@ -376,7 +604,7 @@ client.on('interactionCreate', async (interaction) => {
 
       if (colReason === 'skipped') {
         await pollMessage.edit({
-          content: `stage 1 skipped by admin/initiator. moving to stage 2 duration selection for ${targetMember.user}.`,
+          content: `stage 1 skipped by admin/owner. moving to stage 2 duration selection for ${targetMember.user}.`,
           components: []
         });
         return startStage2Poll(interaction.channel, targetMember, action, reason, settings, pollState.initiatorId);
@@ -503,8 +731,13 @@ async function startStage2Poll(channel, targetMember, action, reason, settings, 
       } else if (action === 'mute') {
         await targetMember.voice.setMute(true, auditReason);
         const unmuteAtTimestamp = Math.floor((Date.now() + durationMs) / 1000);
-        saveActiveMute(targetMember.guild.id, targetMember.id, unmuteAtTimestamp);
+        saveActivePunishment(targetMember.guild.id, targetMember.id, 'mute', unmuteAtTimestamp);
         scheduleUnmute(targetMember.guild.id, targetMember.id, durationMs);
+      } else if (action === 'deafen') {
+        await targetMember.voice.setDeaf(true, auditReason);
+        const unmuteAtTimestamp = Math.floor((Date.now() + durationMs) / 1000);
+        saveActivePunishment(targetMember.guild.id, targetMember.id, 'deafen', unmuteAtTimestamp);
+        scheduleUndeafen(targetMember.guild.id, targetMember.id, durationMs);
       }
       await stage2Msg.edit({
         content: `vote ended. ${targetMember.user} got ${action} for ${displayDuration}${reasonText}.`,
