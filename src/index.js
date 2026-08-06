@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ComponentType } = require('discord.js');
-const { initDb, getGuildSettings, updateGuildSetting, checkUserCooldown, updateUserCooldown, saveActiveMute, removeActiveMute, getPendingMutes } = require('./db/database');
+const { initDb, getGuildSettings, updateGuildSetting, checkUserCooldown, updateUserCooldown, saveActiveMute, removeActiveMute, getPendingMutes, getActiveMuteForUser, getExpiredMutes } = require('./db/database');
 const { evaluateStage1Result, checkImmunity } = require('./logic/democracyEngine');
 
 initDb();
@@ -8,6 +8,15 @@ initDb();
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates] });
 
 const activePolls = new Map();
+
+function findPollByTarget(targetId) {
+  for (const [channelId, poll] of activePolls.entries()) {
+    if (poll.targetId === targetId) {
+      return poll;
+    }
+  }
+  return null;
+}
 
 const commands = [
   new SlashCommandBuilder()
@@ -33,7 +42,15 @@ const commands = [
         { name: 'poll_duration_seconds', value: 'poll_duration_seconds' },
         { name: 'user_cooldown_seconds', value: 'user_cooldown_seconds' }
       ))
-    .addStringOption(opt => opt.setName('value').setDescription('setting value').setRequired(true))
+    .addStringOption(opt => opt.setName('value').setDescription('setting value').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('check-status')
+    .setDescription('check voting status and active punishments for a member')
+    .addUserOption(opt => opt.setName('target').setDescription('member to check (defaults to self)').setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('skip-stage')
+    .setDescription('skip the current stage of an active vote for a member')
+    .addUserOption(opt => opt.setName('target').setDescription('member whose vote stage to skip').setRequired(true))
 ];
 
 client.once('ready', async () => {
@@ -58,14 +75,22 @@ function scheduleUnmute(guildId, userId, delayMs) {
       const guild = await client.guilds.fetch(guildId).catch(() => null);
       if (guild) {
         const member = await guild.members.fetch(userId).catch(() => null);
-        if (member && member.voice && member.voice.channel) {
-          await member.voice.setMute(false, 'democratic vote mute duration expired');
+        if (member) {
+          if (member.voice && member.voice.channel) {
+            await member.voice.setMute(false, 'democratic vote mute duration expired');
+            removeActiveMute(guildId, userId);
+          } else {
+            // Member is currently not in a voice channel.
+            // Leave active_mutes entry in DB so voiceStateUpdate will unmute upon joining VC.
+          }
+        } else {
+          removeActiveMute(guildId, userId);
         }
+      } else {
+        removeActiveMute(guildId, userId);
       }
     } catch (err) {
       console.error(`failed to unmute user ${userId}:`, err);
-    } finally {
-      removeActiveMute(guildId, userId);
     }
   }, Math.max(0, delayMs));
 }
@@ -82,6 +107,35 @@ function restorePendingVoiceMutes() {
     }
   }
 }
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  if (!newState.channelId) return;
+  const guildId = newState.guild.id;
+  const userId = newState.id;
+  const activeMute = getActiveMuteForUser(guildId, userId);
+  if (!activeMute) return;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (activeMute.unmute_at <= now) {
+    try {
+      if (newState.member) {
+        await newState.member.voice.setMute(false, 'democratic vote mute duration expired');
+      }
+    } catch (err) {
+      console.error(`failed to unmute user ${userId} on VC join:`, err);
+    } finally {
+      removeActiveMute(guildId, userId);
+    }
+  } else {
+    if (newState.member && !newState.serverMute) {
+      try {
+        await newState.member.voice.setMute(true, 'active democratic vote mute');
+      } catch (err) {
+        console.error(`failed to re-enforce mute for user ${userId} on VC join:`, err);
+      }
+    }
+  }
+});
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -105,6 +159,80 @@ client.on('interactionCreate', async (interaction) => {
 
     updateGuildSetting(guildId, settingKey, val);
     return interaction.reply({ content: `set ${settingKey} to ${val}`, ephemeral: true });
+  }
+
+  if (commandName === 'check-status') {
+    const targetUser = interaction.options.getUser('target') || user;
+    const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+
+    const statusLines = [`**status check for ${targetUser}**:`];
+
+    // 1. Active poll
+    const poll = findPollByTarget(targetUser.id);
+    if (poll) {
+      const channelMention = `<#${poll.channelId}>`;
+      statusLines.push(`• **active poll**: stage ${poll.stage} (${poll.action}) in ${channelMention}`);
+      if (poll.stage === 1) {
+        statusLines.push(`  votes: yes: ${poll.votes.yes.size} | no: ${poll.votes.no.size}`);
+      } else if (poll.stage === 2) {
+        statusLines.push(`  duration voting in progress`);
+      }
+    } else {
+      statusLines.push(`• **active poll**: none`);
+    }
+
+    // 2. Active punishment
+    const now = Math.floor(Date.now() / 1000);
+    const activeMute = getActiveMuteForUser(guildId, targetUser.id);
+    if (activeMute) {
+      const remaining = activeMute.unmute_at - now;
+      if (remaining > 0) {
+        statusLines.push(`• **voice mute**: active (unmutes <t:${activeMute.unmute_at}:R>)`);
+      } else {
+        statusLines.push(`• **voice mute**: expired (will clear upon joining voice)`);
+      }
+    } else {
+      statusLines.push(`• **voice mute**: none`);
+    }
+
+    if (targetMember && targetMember.communicationDisabledUntilTimestamp && targetMember.communicationDisabledUntilTimestamp > Date.now()) {
+      const timeoutEndSec = Math.floor(targetMember.communicationDisabledUntilTimestamp / 1000);
+      statusLines.push(`• **timeout**: active (ends <t:${timeoutEndSec}:R>)`);
+    } else {
+      statusLines.push(`• **timeout**: none`);
+    }
+
+    // 3. Cooldown
+    const isCooldowned = !checkUserCooldown(guildId, targetUser.id, settings.user_cooldown_seconds);
+    statusLines.push(`• **cooldown**: ${isCooldowned ? 'on cooldown' : 'ready'}`);
+
+    return interaction.reply({ content: statusLines.join('\n'), ephemeral: true });
+  }
+
+  if (commandName === 'skip-stage') {
+    const targetUser = interaction.options.getUser('target');
+    const poll = findPollByTarget(targetUser.id);
+    if (!poll) {
+      return interaction.reply({ content: `no active vote running for ${targetUser}`, ephemeral: true });
+    }
+
+    const isStarter = poll.initiatorId === user.id;
+    const isOwner = interaction.guild.ownerId === user.id;
+    const isAdmin = member.permissions.has('Administrator');
+
+    if (!isStarter && !isOwner && !isAdmin) {
+      return interaction.reply({ content: 'only the person who started the vote or an admin can skip its stage', ephemeral: true });
+    }
+
+    if (poll.stage === 1) {
+      poll.stoppedReason = `skipped by ${user}`;
+      poll.collector.stop('skipped');
+      return interaction.reply({ content: `skipped stage 1 vote for ${targetUser}` });
+    } else if (poll.stage === 2) {
+      poll.stoppedReason = `skipped by ${user}`;
+      poll.collector.stop('skipped');
+      return interaction.reply({ content: `skipped stage 2 duration selection for ${targetUser}` });
+    }
   }
 
   if (commandName === 'stop-vote') {
@@ -203,7 +331,19 @@ client.on('interactionCreate', async (interaction) => {
       time: settings.poll_duration_seconds * 1000
     });
 
-    const pollState = { initiatorId: user.id, collector, stoppedReason: null };
+    const pollState = {
+      channelId,
+      targetId: targetUser.id,
+      targetMember,
+      initiatorId: user.id,
+      stage: 1,
+      action,
+      reason,
+      collector,
+      pollMessage,
+      votes,
+      stoppedReason: null
+    };
     activePolls.set(channelId, pollState);
 
     collector.on('collect', async (i) => {
@@ -233,6 +373,14 @@ client.on('interactionCreate', async (interaction) => {
           content: `vote was stopped.`,
           components: []
         });
+      }
+
+      if (colReason === 'skipped') {
+        await pollMessage.edit({
+          content: `stage 1 skipped by admin/initiator. moving to stage 2 duration selection for ${targetMember.user}.`,
+          components: []
+        });
+        return startStage2Poll(interaction.channel, targetMember, action, reason, settings, pollState.initiatorId);
       }
 
       const votesObj = { yes: Array.from(votes.yes), no: Array.from(votes.no) };
@@ -283,7 +431,20 @@ async function startStage2Poll(channel, targetMember, action, reason, settings, 
     time: settings.poll_duration_seconds * 1000
   });
 
-  activePolls.set(channel.id, { initiatorId, collector, stoppedReason: null });
+  const pollState = {
+    channelId: channel.id,
+    targetId: targetMember.id,
+    targetMember,
+    initiatorId,
+    stage: 2,
+    action,
+    reason,
+    collector,
+    stage2Msg,
+    durationVotes,
+    stoppedReason: null
+  };
+  activePolls.set(channel.id, pollState);
 
   collector.on('collect', async (i) => {
     Object.keys(durationVotes).forEach(k => durationVotes[k].delete(i.user.id));
@@ -330,7 +491,7 @@ async function startStage2Poll(channel, targetMember, action, reason, settings, 
       '5m': 5 * 60 * 1000,
       '10m': 10 * 60 * 1000,
       '15m': 15 * 60 * 1000,
-      '1y': 1 * 60 * 1000 // 1 year maps to 1 minute as secret prank
+      '1y': 365 * 24 * 60 * 60 * 1000
     };
 
     const durationMs = durationMsMap[winningDuration];
@@ -363,4 +524,4 @@ if (process.env.DISCORD_TOKEN) {
   client.login(process.env.DISCORD_TOKEN);
 }
 
-module.exports = { client, startStage2Poll };
+module.exports = { client, startStage2Poll, activePolls, findPollByTarget, commands };

@@ -82,4 +82,17 @@ function getPendingMutes() {
   return db.prepare('SELECT * FROM active_mutes').all();
 }
 
-module.exports = { initDb, getGuildSettings, updateGuildSetting, checkUserCooldown, updateUserCooldown, saveActiveMute, removeActiveMute, getPendingMutes };
+function getActiveMuteForUser(guildId, userId) {
+  return db.prepare('SELECT * FROM active_mutes WHERE guild_id = ? AND user_id = ?').get(guildId, userId);
+}
+
+function getExpiredMutes(guildId, userId) {
+  const now = Math.floor(Date.now() / 1000);
+  if (guildId && userId) {
+    return db.prepare('SELECT * FROM active_mutes WHERE guild_id = ? AND user_id = ? AND unmute_at <= ?').all(guildId, userId, now);
+  }
+  return db.prepare('SELECT * FROM active_mutes WHERE unmute_at <= ?').all(now);
+}
+
+module.exports = { initDb, getGuildSettings, updateGuildSetting, checkUserCooldown, updateUserCooldown, saveActiveMute, removeActiveMute, getPendingMutes, getActiveMuteForUser, getExpiredMutes };
+
