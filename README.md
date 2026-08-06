@@ -18,7 +18,7 @@ A Discord bot that gives your community democratic control over temporary timeou
 | --- | --- | --- |
 | `/vote-punish target action [reason]` | Start a vote to `timeout` or `mute` a member. If targeting someone in a voice channel, you must be in the same voice channel. | Anyone (subject to cooldown) |
 | `/stop-vote` | Cancel the vote running in the current channel. | Poll Initiator, Server Owner, or Admin |
-| `/skip-stage target` | Skip the current stage of an active vote for a member (advances Stage 1 to Stage 2, or Stage 2 straight to punishment). | Poll Initiator, Server Owner, or Admin |
+| `/skip-stage target` | Skip the current stage of an active vote for a member (advances Stage 1 to Stage 2, or Stage 2 straight to punishment). | Server Owner or Admin |
 | `/check-status [target]` | View active polls, voice mute/timeout status, remaining duration, and cooldown status for a member (or yourself if left blank). | Anyone |
 | `/config setting value` | Configure server thresholds (`threshold_type`, `threshold_value`, `poll_duration_seconds`, `user_cooldown_seconds`). | Admin Only |
 

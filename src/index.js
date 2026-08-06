@@ -216,12 +216,11 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ content: `no active vote running for ${targetUser}`, ephemeral: true });
     }
 
-    const isStarter = poll.initiatorId === user.id;
     const isOwner = interaction.guild.ownerId === user.id;
     const isAdmin = member.permissions.has('Administrator');
 
-    if (!isStarter && !isOwner && !isAdmin) {
-      return interaction.reply({ content: 'only the person who started the vote or an admin can skip its stage', ephemeral: true });
+    if (!isOwner && !isAdmin) {
+      return interaction.reply({ content: 'only server owners or admins can skip vote stages', ephemeral: true });
     }
 
     if (poll.stage === 1) {
